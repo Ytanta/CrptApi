@@ -2,7 +2,6 @@ package org.example;
 
 public class Main {
     public static void main(String[] args) {
-        // 1. Создаём клиента
         CrptApi api = new CrptApi(
                 "https://ismp.crpt.ru/api/v3",
                 CrptApi.TimeUnit.MINUTES,
