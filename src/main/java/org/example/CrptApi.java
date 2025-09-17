@@ -1,247 +1,214 @@
 package org.example;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.net.URI;
-import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.TimeUnit;
+import java.util.UUID;
 import java.util.concurrent.locks.ReentrantLock;
 
-/**
- * Thread-safe CrptApi client with rate limiting for "Честный Знак".
- *
- * Supports:
- * - Получение аутентификационного токена (по схеме с УКЭП подписью)
- * - Создание документа ввода в оборот товара, произведенного в РФ
- *
- * Конструктор принимает ограничения на количество запросов в указанный интервал.
- *
- * Вся реализация в одном файле, внутренние классы.
- */
 public class CrptApi {
+
+    private final String baseApiUrl;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
-    private final RateLimiter rateLimiter;
-    private final String baseApiUrl;
+    private final TokenBucketRateLimiter rateLimiter;
 
-    /**
-     * Создает CrptApi клиент с ограничением количества запросов.
-     * @param timeUnit период времени (секунды, минуты и т.п.)
-     * @param requestLimit максимально допустимое количество запросов в период
-     */
-    public CrptApi(TimeUnit timeUnit, int requestLimit) {
-        this(timeUnit, requestLimit, "https://ismp.crpt.ru/api/v3");
+    public CrptApi(String baseApiUrl, TimeUnit timeUnit, int requestLimit) {
+        this.baseApiUrl = baseApiUrl;
+        this.httpClient = HttpClient.newHttpClient();
+        this.objectMapper = new ObjectMapper();
+        this.rateLimiter = new TokenBucketRateLimiter(requestLimit, timeUnit.toMillis());
     }
 
-    /**
-     * Конструктор с указанием базового URL API.
-     */
-    public CrptApi(TimeUnit timeUnit, int requestLimit, String baseApiUrl) {
-        if (requestLimit <= 0) throw new IllegalArgumentException("Request limit must be positive");
-        this.baseApiUrl = Objects.requireNonNull(baseApiUrl, "baseApiUrl cannot be null");
-        this.rateLimiter = new TokenBucketRateLimiter(requestLimit, timeUnit);
-        this.httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
-        this.objectMapper = new ObjectMapper()
-                .setSerializationInclusion(JsonInclude.Include.NON_NULL);
-    }
 
-    // -----------------------------------
-    // --- Аутентификация по УКЭП ----------
-    // -----------------------------------
-
-    /**
-     * Запрашивает случайную строку для подписи (uuid и data).
-     */
-    public AuthKeyResponse getAuthKey() throws IOException, InterruptedException {
+    public AuthKeyResponse getAuthKey() {
         rateLimiter.acquire();
-        HttpRequest req = HttpRequest.newBuilder()
+        HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(baseApiUrl + "/auth/cert/key"))
                 .GET()
-                .header("Accept", "application/json")
+                .timeout(Duration.ofSeconds(10))
                 .build();
-        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        checkSuccess(resp);
-        return objectMapper.readValue(resp.body(), AuthKeyResponse.class);
-    }
-
-    /**
-     * Отправляет подписанные base64 данные, получает токен аутентификации.
-     *
-     * @param uuid полученный на шаге getAuthKey
-     * @param signedDataBase64 открепленная подпись base64
-     * @return токен для последующих запросов
-     */
-    public String getAuthToken(String uuid, String signedDataBase64) throws IOException, InterruptedException {
-        rateLimiter.acquire();
-        Map<String, String> body = Map.of("uuid", uuid, "data", signedDataBase64);
-        String jsonBody = toJson(body);
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(baseApiUrl + "/auth/cert/"))
-                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
-                .header("Content-Type", "application/json;charset=UTF-8")
-                .header("Accept", "application/json")
-                .build();
-        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-        checkSuccess(resp);
-        Map<String, String> map = objectMapper.readValue(resp.body(), Map.class);
-        if (!map.containsKey("token")) throw new RuntimeException("Token missing in auth response");
-        return map.get("token");
-    }
-
-    // -----------------------------------
-    // --- Метод создания документа ввода в оборот ---
-    // -----------------------------------
-
-    /**
-     * Создает документ для ввода в оборот товара, произведенного в РФ.
-     *
-     * @param productGroup Код товарной группы (например "clothes", "milk" и т.п.)
-     * @param documentDto Java объект документа (будет сериализован в JSON и закодирован base64)
-     * @param documentSignatureBase64 Открепленная подпись документа в base64
-     * @param authToken Токен аутентификации из getAuthToken
-     * @return ApiResponse с HTTP статусом и телом ответа
-     * @throws IOException, InterruptedException
-     */
-    public ApiResponse createIntroduceGoodsDocument(
-            String productGroup,
-            Object documentDto,
-            String documentSignatureBase64,
-            String authToken
-    ) throws IOException, InterruptedException {
-        rateLimiter.acquire();
-
-        // Сериализация JSON и кодирование в base64
-        String jsonDocument = toJson(documentDto);
-        String productDocumentBase64 = Base64.getEncoder().encodeToString(jsonDocument.getBytes(StandardCharsets.UTF_8));
-
-        Map<String, String> body = Map.of(
-                "document_format", "MANUAL",
-                "product_document", productDocumentBase64,
-                "product_group", productGroup,
-                "signature", documentSignatureBase64,
-                "type", "LP_INTRODUCE_GOODS"
-        );
-
-        String requestBody = toJson(body);
-
-        String url = baseApiUrl + "/lk/documents/create?pg=" + URLEncoder.encode(productGroup, StandardCharsets.UTF_8);
-
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + authToken)
-                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-                .build();
-
-        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-
-        return new ApiResponse(resp.statusCode(), resp.body());
-    }
-
-    // -----------------------------------
-    // --- Вспомогательные методы и классы ---
-    // -----------------------------------
-
-    private void checkSuccess(HttpResponse<?> response) {
-        int code = response.statusCode();
-        if (code < 200 || code >= 300) {
-            throw new RuntimeException("HTTP error " + code + ": " + response.body());
-        }
-    }
-
-    private String toJson(Object obj) {
         try {
-            return objectMapper.writeValueAsString(obj);
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException("JSON serialization error", e);
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            checkResponse(response);
+            return objectMapper.readValue(response.body(), AuthKeyResponse.class);
+        } catch (IOException | InterruptedException e) {
+            throw new ApiException("Ошибка при получении auth-key", e);
         }
     }
 
-    // Ответ с ключом для подписи
+    public AuthTokenResponse getAuthToken(String uuid, String signedData) {
+        rateLimiter.acquire();
+        AuthTokenRequest req = new AuthTokenRequest(uuid, signedData);
+        try {
+            String body = objectMapper.writeValueAsString(req);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseApiUrl + "/auth/cert/" + uuid))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .timeout(Duration.ofSeconds(10))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            checkResponse(response);
+            return objectMapper.readValue(response.body(), AuthTokenResponse.class);
+        } catch (IOException | InterruptedException e) {
+            throw new ApiException("Ошибка при получении auth-token", e);
+        }
+    }
+
+    public String createIntroduceGoodsDocument(IntroduceGoodsDocument doc, String signature, String authToken) {
+        rateLimiter.acquire();
+        try {
+            String jsonDoc = objectMapper.writeValueAsString(doc);
+            String base64Doc = Base64.getEncoder().encodeToString(jsonDoc.getBytes(StandardCharsets.UTF_8));
+
+            DocumentRequest requestDto = new DocumentRequest("LP_INTRODUCE_GOODS", base64Doc, signature);
+            String body = objectMapper.writeValueAsString(requestDto);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(baseApiUrl + "/lk/documents/create"))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + authToken)
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .timeout(Duration.ofSeconds(15))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            checkResponse(response);
+            return response.body();
+        } catch (IOException | InterruptedException e) {
+            throw new ApiException("Ошибка при создании документа LP_INTRODUCE_GOODS", e);
+        }
+    }
+
+    private void checkResponse(HttpResponse<String> response) {
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new ApiException("Ошибка API: HTTP " + response.statusCode() + " → " + response.body());
+        }
+    }
+
     public static class AuthKeyResponse {
         public String uuid;
         public String data;
-
-        public String getUuid() { return uuid; }
-        public String getData() { return data; }
     }
 
-    // Ответ API с кодом и телом
-    public static class ApiResponse {
-        private final int statusCode;
-        private final String body;
+    public static class AuthTokenRequest {
+        public final String uuid;
+        @JsonProperty("signed_data")
+        public final String signedData;
 
-        public ApiResponse(int statusCode, String body) {
-            this.statusCode = statusCode;
-            this.body = body;
+        public AuthTokenRequest(String uuid, String signedData) {
+            this.uuid = uuid;
+            this.signedData = signedData;
         }
-        public int getStatusCode() { return statusCode; }
-        public String getBody() { return body; }
     }
 
-    // Интерфейс для rate limiter
-    private interface RateLimiter {
-        void acquire() throws InterruptedException;
+    public static class AuthTokenResponse {
+        @JsonProperty("auth_token")
+        public String authToken;
     }
 
-    /**
-     * Token Bucket rate limiter.
-     * Позволяет не более requestLimit запросов за 1 unit времени.
-     * Блокирует поток при превышении лимита.
-     */
-    private static class TokenBucketRateLimiter implements RateLimiter {
+    public static class DocumentRequest {
+        public final String document_format;
+        public final String product_document;
+        public final String signature;
+
+        public DocumentRequest(String documentFormat, String productDocument, String signature) {
+            this.document_format = documentFormat;
+            this.product_document = productDocument;
+            this.signature = signature;
+        }
+    }
+
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public static class IntroduceGoodsDocument {
+        public String participantInn;
+        public String ownerInn;
+        public String producerInn;
+        public String productionDate;
+        public String certificateDocument;
+        public String certificateDocumentDate;
+        public String certificateDocumentNumber;
+        // можно добавить вложенные поля под товары
+    }
+
+    private static class TokenBucketRateLimiter {
+        private final long refillIntervalMillis;
         private final int capacity;
-        private final long refillPeriodNanos;
-        private double tokens;
-        private long lastRefillTime;
+        private int tokens;
+        private long lastRefillTimestamp;
         private final ReentrantLock lock = new ReentrantLock();
 
-        public TokenBucketRateLimiter(int capacity, TimeUnit timeUnit) {
+        public TokenBucketRateLimiter(int capacity, long refillIntervalMillis) {
             this.capacity = capacity;
+            this.refillIntervalMillis = refillIntervalMillis;
             this.tokens = capacity;
-            this.refillPeriodNanos = timeUnit.toNanos(1);
-            this.lastRefillTime = System.nanoTime();
+            this.lastRefillTimestamp = System.currentTimeMillis();
         }
 
-        @Override
-        public void acquire() throws InterruptedException {
+        public void acquire() {
             lock.lock();
             try {
                 refill();
-                while (tokens < 1) {
-                    long waitTime = (long) ((1 - tokens) * refillPeriodNanos / capacity);
-                    if (waitTime > 0) {
-                        TimeUnit.NANOSECONDS.sleep(waitTime);
-                        refill();
+                while (tokens == 0) {
+                    long sleepTime = lastRefillTimestamp + refillIntervalMillis - System.currentTimeMillis();
+                    if (sleepTime > 0) {
+                        try {
+                            Thread.sleep(sleepTime);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
+                    refill();
                 }
-                tokens -= 1;
+                tokens--;
             } finally {
                 lock.unlock();
             }
         }
 
         private void refill() {
-            long now = System.nanoTime();
-            double tokensToAdd = (now - lastRefillTime) * capacity / (double) refillPeriodNanos;
-            if (tokensToAdd > 0) {
-                tokens = Math.min(capacity, tokens + tokensToAdd);
-                lastRefillTime = now;
+            long now = System.currentTimeMillis();
+            if (now - lastRefillTimestamp >= refillIntervalMillis) {
+                tokens = capacity;
+                lastRefillTimestamp = now;
             }
+        }
+    }
+
+    public enum TimeUnit {
+        SECONDS(1000), MINUTES(60_000);
+
+        private final long millis;
+
+        TimeUnit(long millis) {
+            this.millis = millis;
+        }
+
+        public long toMillis() {
+            return millis;
+        }
+    }
+
+    public static class ApiException extends RuntimeException {
+        public ApiException(String message) {
+            super(message);
+        }
+
+        public ApiException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 }
